@@ -62,6 +62,24 @@ jobs:
           $p = "C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\"
           if (Test-Path $p) { "DXSDK_DIR=$p" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
 
+      - name: Prepare dependency folders (project expects them inside sakura\)
+        shell: pwsh
+        run: |
+          foreach ($d in 'imgui','lua','luabridge') {
+            $target = "sakura\$d"
+            if (-not (Test-Path $target)) {
+              New-Item -ItemType Junction -Path $target -Target (Resolve-Path $d).Path | Out-Null
+              Write-Host "Linked $target -> $d"
+            } else {
+              Write-Host "$target exists, adding any missing files"
+              robocopy $d $target /E /XC /XN /XO /NFL /NDL /NJH /NJS | Out-Null
+              $global:LASTEXITCODE = 0
+            }
+          }
+          Write-Host "Folders inside sakura\:"
+          Get-ChildItem sakura -Directory | ForEach-Object { Write-Host " - $($_.Name)" }
+          Write-Host "imgui.h present: $(Test-Path 'sakura\imgui\imgui.h')"
+
       - name: Build sakura (DLL)
         shell: pwsh
         run: msbuild sakura\sakura.vcxproj /m /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
