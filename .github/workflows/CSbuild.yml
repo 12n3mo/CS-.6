@@ -86,10 +86,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $skip = '\\(obj|\.git|imgui|lua|detours|luabridge|xorgen-2023|dist)\\'
-          Get-ChildItem -Recurse -File -Include *.dll,*.exe |
-            Where-Object { $_.FullName -match '\\Release\\' -and $_.FullName -notmatch $skip } |
-            ForEach-Object { Copy-Item $_.FullName dist\ -Force; Write-Host "Collected $($_.Name)" }
+          # The project writes its output to sakura\sakura\ (not a Release folder).
+          foreach ($f in 'sakura\sakura\sakura.dll','sakura\sakura\sakura.exe') {
+            if (Test-Path $f) { Copy-Item $f dist\ -Force; Write-Host "Collected $f" }
+            else { Write-Warning "Missing $f" }
+          }
           if (-not (Get-ChildItem dist -File)) { throw "No binaries found - check the build log." }
           Get-FileHash dist\* -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  $(Split-Path $_.Path -Leaf)" } |
