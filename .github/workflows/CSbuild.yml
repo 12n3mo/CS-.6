@@ -1,0 +1,166 @@
+name: Build and Scan Sakura
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_flagged:
+        description: "Upload binaries even if scans flag something"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  VT_API_KEY: ${{ secrets.VT_API_KEY }}
+
+jobs:
+  build-scan:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify submodule sources
+        shell: bash
+        run: |
+          git submodule status
+          bad=0
+          for url in $(git config -f .gitmodules --get-regexp 'submodule\..*\.url' | awk '{print $2}'); do
+            echo "submodule: $url"
+            if ! echo "$url" | grep -qiE '^https://github.com/(microsoft|ocornut|lua|vinniefalco|rbl-dot|nc-gp)/'; then
+              echo "::error::Unexpected submodule source: $url"
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: Scan source for suspicious patterns (informational)
+        shell: bash
+        run: |
+          grep -rnIE 'URLDownloadToFile|InternetOpen|InternetReadFile|WinHttp|discord(app)?\.com/api/webhooks|api\.telegram\.org|powershell|cmd\.exe /c|WinExec|ShellExecute' \
+            --include=*.cpp --include=*.h --include=*.hpp --include=*.c \
+            --exclude-dir=imgui --exclude-dir=lua --exclude-dir=detours --exclude-dir=luabridge --exclude-dir=xorgen-2023 --exclude-dir=.git . > source_hits.txt || true
+          {
+            echo '### Source scan hits (review manually)'
+            echo '```'
+            head -n 100 source_hits.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install DirectX SDK (needed by loader)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          choco install directx-sdk -y --no-progress
+          $p = "C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\"
+          if (Test-Path $p) { "DXSDK_DIR=$p" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+
+      - name: Build sakura (DLL)
+        shell: pwsh
+        run: msbuild sakura\sakura.vcxproj /m /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Build loader
+        shell: pwsh
+        continue-on-error: true
+        run: msbuild sakura\loader\loader.vcxproj /m /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $skip = '\\(obj|\.git|imgui|lua|detours|luabridge|xorgen-2023|dist)\\'
+          Get-ChildItem -Recurse -File -Include *.dll,*.exe |
+            Where-Object { $_.FullName -match '\\Release\\' -and $_.FullName -notmatch $skip } |
+            ForEach-Object { Copy-Item $_.FullName dist\ -Force; Write-Host "Collected $($_.Name)" }
+          if (-not (Get-ChildItem dist -File)) { throw "No binaries found - check the build log." }
+          Get-FileHash dist\* -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Scan with Microsoft Defender
+        id: defender
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          & $mp -SignatureUpdate
+          & $mp -Scan -ScanType 3 -File "$PWD\dist" -DisableRemediation
+          if ($LASTEXITCODE -ne 0) { throw "Defender reported a problem (exit code $LASTEXITCODE)" }
+
+      - name: Scan with VirusTotal
+        id: vt
+        if: env.VT_API_KEY != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in dist/*.dll dist/*.exe; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            echo "Uploading $name"
+            id=$(curl -sS -X POST https://www.virustotal.com/api/v3/files \
+                  -H "x-apikey: $VT_API_KEY" -F "file=@$f" | jq -r '.data.id')
+            if [ -z "$id" ] || [ "$id" = "null" ]; then
+              echo "::error::VirusTotal upload failed for $name"; fail=1; continue
+            fi
+            status=""
+            for i in $(seq 1 40); do
+              sleep 20
+              res=$(curl -sS "https://www.virustotal.com/api/v3/analyses/$id" -H "x-apikey: $VT_API_KEY")
+              status=$(echo "$res" | jq -r '.data.attributes.status')
+              [ "$status" = "completed" ] && break
+            done
+            if [ "$status" != "completed" ]; then
+              echo "::error::VirusTotal analysis timed out for $name"; fail=1; continue
+            fi
+            mal=$(echo "$res" | jq -r '.data.attributes.stats.malicious')
+            sus=$(echo "$res" | jq -r '.data.attributes.stats.suspicious')
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            det=$(echo "$res" | jq -r '.data.attributes.results | to_entries[] | select(.value.category=="malicious") | "\(.key): \(.value.result)"')
+            {
+              echo "### $name - malicious=$mal suspicious=$sus"
+              echo "https://www.virustotal.com/gui/file/$sha"
+              echo '```'
+              echo "$det"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "$det"
+            # HackTool/Cheat-style names are expected for a game cheat; real malware families are not.
+            if echo "$det" | grep -qiE 'trojan|stealer|ransom|miner|backdoor|spy|worm|keylog|dropper|downloader|banker|rootkit'; then
+              echo "::error::$name has serious malware-style detections"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Verdict
+        shell: bash
+        run: |
+          echo "defender=${{ steps.defender.outcome }} virustotal=${{ steps.vt.outcome }}"
+          if [ "${{ steps.vt.outcome }}" = "skipped" ]; then
+            echo "::warning::VirusTotal skipped (no VT_API_KEY secret set)"
+          fi
+          if [ "${{ steps.defender.outcome }}" = "failure" ] || [ "${{ steps.vt.outcome }}" = "failure" ]; then
+            if [ "${{ inputs.allow_flagged }}" = "true" ]; then
+              echo "::warning::Scans flagged something but allow_flagged=true"
+            else
+              echo "::error::Scans flagged the build. Check the logs and the job summary."
+              exit 1
+            fi
+          fi
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: sakura-build-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
