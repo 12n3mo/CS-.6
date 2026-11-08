@@ -62,23 +62,16 @@ jobs:
           $p = "C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\"
           if (Test-Path $p) { "DXSDK_DIR=$p" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
 
-      - name: Prepare dependency folders (project expects them inside sakura\)
+      - name: Point the compiler at the dependency folders
         shell: pwsh
         run: |
-          foreach ($d in 'imgui','lua','luabridge') {
-            $target = "sakura\$d"
-            if (-not (Test-Path $target)) {
-              New-Item -ItemType Junction -Path $target -Target (Resolve-Path $d).Path | Out-Null
-              Write-Host "Linked $target -> $d"
-            } else {
-              Write-Host "$target exists, adding any missing files"
-              robocopy $d $target /E /XC /XN /XO /NFL /NDL /NJH /NJS | Out-Null
-              $global:LASTEXITCODE = 0
-            }
-          }
-          Write-Host "Folders inside sakura\:"
-          Get-ChildItem sakura -Directory | ForEach-Object { Write-Host " - $($_.Name)" }
-          Write-Host "imgui.h present: $(Test-Path 'sakura\imgui\imgui.h')"
+          # The project expects imgui/lua/luabridge inside sakura\, but they are cloned at the repo root.
+          # Adding the root folders through the CL variable avoids including the same header from two paths.
+          $root = $env:GITHUB_WORKSPACE
+          $inc = "/I$root\imgui /I$root\lua /I$root\luabridge\Source"
+          "CL=$inc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "CL=$inc"
+          Write-Host "imgui.h present: $(Test-Path "$root\imgui\imgui.h")"
 
       - name: Build sakura (DLL)
         shell: pwsh
